@@ -3,9 +3,9 @@ import binascii
 import enum
 import hmac
 import ipaddress
-from collections import OrderedDict
+from collections.abc import Callable
 from struct import pack, unpack
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Optional, Protocol
 
 from .utils import random_transaction_id
 
@@ -35,28 +35,31 @@ def message_integrity(data: bytes, key: bytes) -> bytes:
     return hmac.new(key, check_data, "sha1").digest()
 
 
-def xor_address(data: bytes, transaction_id: bytes) -> bytes:
+def xor_data(data: bytes, transaction_id: bytes) -> bytes:
     xpad = pack("!HI", COOKIE >> 16, COOKIE) + transaction_id
-    xdata = data[0:2]
-    for i in range(2, len(data)):
-        xdata += int.to_bytes(data[i] ^ xpad[i - 2], 1, "big", signed=False)
+    xdata = b""
+    for i in range(len(data)):
+        xdata += int.to_bytes(data[i] ^ xpad[i], 1, "big", signed=False)
     return xdata
 
 
-def pack_address(value: Tuple[str, int]) -> bytes:
+def pack_address(
+    value: tuple[str, int],
+    xor: Callable[[bytes], bytes] = lambda x: x,
+) -> bytes:
     ip_address = ipaddress.ip_address(value[0])
     if isinstance(ip_address, ipaddress.IPv4Address):
         protocol = IPV4_PROTOCOL
     else:
         protocol = IPV6_PROTOCOL
-    return pack("!BBH", 0, protocol, value[1]) + ip_address.packed
+    return pack("!BB", 0, protocol) + xor(pack("!H", value[1]) + ip_address.packed)
 
 
 def pack_bytes(value: bytes) -> bytes:
     return value
 
 
-def pack_error_code(value: Tuple[int, str]) -> bytes:
+def pack_error_code(value: tuple[int, str]) -> bytes:
     return pack("!HBB", 0, value[0] // 100, value[0] % 100) + value[1].encode("utf8")
 
 
@@ -80,36 +83,53 @@ def pack_unsigned_64(value: int) -> bytes:
     return pack("!Q", value)
 
 
-def pack_xor_address(value: Tuple[str, int], transaction_id: bytes) -> bytes:
-    return xor_address(pack_address(value), transaction_id)
+def pack_xor_address(value: tuple[str, int], transaction_id: bytes) -> bytes:
+    return pack_address(value, lambda x: xor_data(x, transaction_id))
 
 
-def unpack_address(data: bytes) -> Tuple[str, int]:
+def unpack_address(
+    data: bytes,
+    xor: Callable[[bytes], bytes] = lambda x: x,
+) -> tuple[str, int]:
     if len(data) < 4:
         raise ValueError("STUN address length is less than 4 bytes")
-    reserved, protocol, port = unpack("!BBH", data[0:4])
-    address = data[4:]
+
+    # The first two bytes are a reserved byte and the protocol family.
+    reserved, protocol = unpack("!BB", data[0:2])
+
+    # The remaining data represents a port and an address.
+    port_address = data[2:]
     if protocol == IPV4_PROTOCOL:
-        if len(address) != 4:
+        # For IPv4 we expect 2 bytes for the port, 4 bytes for the address.
+        if len(port_address) != 6:
             raise ValueError("STUN address has invalid length for IPv4")
-        return (str(ipaddress.IPv4Address(address)), port)
+        port_address = xor(port_address)
+        return (
+            str(ipaddress.IPv4Address(port_address[2:])),
+            unpack("!H", port_address[0:2])[0],
+        )
     elif protocol == IPV6_PROTOCOL:
-        if len(address) != 16:
+        # For IPv6 we expect 2 bytes for the port, 16 bytes for the address.
+        if len(port_address) != 18:
             raise ValueError("STUN address has invalid length for IPv6")
-        return (str(ipaddress.IPv6Address(address)), port)
+        port_address = xor(port_address)
+        return (
+            str(ipaddress.IPv6Address(port_address[2:])),
+            unpack("!H", port_address[0:2])[0],
+        )
     else:
         raise ValueError("STUN address has unknown protocol")
 
 
-def unpack_xor_address(data: bytes, transaction_id: bytes) -> Tuple[str, int]:
-    return unpack_address(xor_address(data, transaction_id))
+def unpack_xor_address(data: bytes, transaction_id: bytes) -> tuple[str, int]:
+    return unpack_address(data, lambda x: xor_data(x, transaction_id))
 
 
 def unpack_bytes(data: bytes) -> bytes:
     return data
 
 
-def unpack_error_code(data: bytes) -> Tuple[int, str]:
+def unpack_error_code(data: bytes) -> tuple[int, str]:
     if len(data) < 4:
         raise ValueError("STUN error code is less than 4 bytes")
     reserved, code_high, code_low = unpack("!HBB", data[0:4])
@@ -137,9 +157,9 @@ def unpack_unsigned_64(data: bytes) -> int:
     return unpack("!Q", data)[0]
 
 
-AttributeEntry = Tuple[int, str, Callable, Callable]
+AttributeEntry = tuple[int, str, Callable, Callable]
 
-ATTRIBUTES: List[AttributeEntry] = [
+ATTRIBUTES: list[AttributeEntry] = [
     (0x0001, "MAPPED-ADDRESS", pack_address, unpack_address),
     (0x0003, "CHANGE-REQUEST", pack_unsigned, unpack_unsigned),
     (0x0004, "SOURCE-ADDRESS", pack_address, unpack_address),
@@ -165,8 +185,8 @@ ATTRIBUTES: List[AttributeEntry] = [
     (0x802C, "OTHER-ADDRESS", pack_address, unpack_address),
 ]
 
-ATTRIBUTES_BY_TYPE: Dict[int, AttributeEntry] = {}
-ATTRIBUTES_BY_NAME: Dict[str, AttributeEntry] = {}
+ATTRIBUTES_BY_TYPE: dict[int, AttributeEntry] = {}
+ATTRIBUTES_BY_NAME: dict[str, AttributeEntry] = {}
 for attr in ATTRIBUTES:
     ATTRIBUTES_BY_TYPE[attr[0]] = attr
     ATTRIBUTES_BY_NAME[attr[1]] = attr
@@ -196,12 +216,12 @@ class Message:
         message_method: Method,
         message_class: Class,
         transaction_id: Optional[bytes] = None,
-        attributes: Optional[OrderedDict] = None,
+        attributes: Optional[dict] = None,
     ) -> None:
         self.message_method = message_method
         self.message_class = message_class
         self.transaction_id = transaction_id or random_transaction_id()
-        self.attributes = attributes or OrderedDict()
+        self.attributes = attributes or {}
 
     def add_message_integrity(self, key: bytes) -> None:
         """
@@ -265,18 +285,22 @@ class TransactionTimeout(TransactionError):
         return "STUN transaction timed out"
 
 
+class TransactionSender(Protocol):
+    def send_stun(self, message: Message, addr: tuple[str, int]) -> None: ...
+
+
 class Transaction:
     def __init__(
         self,
         request: Message,
-        addr: Tuple[str, int],
-        protocol,
+        addr: tuple[str, int],
+        protocol: TransactionSender,
         retransmissions: Optional[int] = None,
     ) -> None:
         self.__addr = addr
-        self.__future: asyncio.Future[
-            Tuple[Message, Tuple[str, int]]
-        ] = asyncio.Future()
+        self.__future: asyncio.Future[tuple[Message, tuple[str, int]]] = (
+            asyncio.Future()
+        )
         self.__request = request
         self.__timeout_delay = RETRY_RTO
         self.__timeout_handle: Optional[asyncio.TimerHandle] = None
@@ -286,14 +310,14 @@ class Transaction:
             retransmissions if retransmissions is not None else RETRY_MAX
         )
 
-    def response_received(self, message: Message, addr: Tuple[str, int]) -> None:
+    def response_received(self, message: Message, addr: tuple[str, int]) -> None:
         if not self.__future.done():
             if message.message_class == Class.RESPONSE:
                 self.__future.set_result((message, addr))
             else:
                 self.__future.set_exception(TransactionFailed(message))
 
-    async def run(self) -> Tuple[Message, Tuple[str, int]]:
+    async def run(self) -> tuple[Message, tuple[str, int]]:
         try:
             self.__retry()
             return await self.__future
@@ -339,7 +363,7 @@ def parse_message(data: bytes, integrity_key: Optional[bytes] = None) -> Message
     if len(data) != HEADER_LENGTH + length:
         raise ValueError("STUN message length does not match")
 
-    attributes: OrderedDict = OrderedDict()
+    attributes = {}
     pos = HEADER_LENGTH
     while pos <= len(data) - 4:
         attr_type, attr_len = unpack("!HH", data[pos : pos + 4])

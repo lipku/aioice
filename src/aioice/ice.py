@@ -2,13 +2,15 @@ import asyncio
 import copy
 import enum
 import ipaddress
+import itertools
 import logging
 import random
+import re
 import secrets
 import socket
 import threading
-from itertools import count
-from typing import Dict, List, Iterable, Optional, Set, Text, Tuple, Union, cast
+from collections.abc import Callable
+from typing import Optional, Union, cast, Iterable
 
 import ifaddr
 
@@ -24,8 +26,8 @@ ICE_FAILED = 2
 CONSENT_FAILURES = 6
 CONSENT_INTERVAL = 5
 
-connection_id = count()
-protocol_id = count()
+connection_id = itertools.count()
+protocol_id = itertools.count()
 
 _mdns = threading.local()
 
@@ -76,7 +78,7 @@ def candidate_pair_priority(
     return (1 << 32) * min(G, D) + 2 * max(G, D) + (G > D and 1 or 0)
 
 
-def get_host_addresses(use_ipv4: bool, use_ipv6: bool) -> List[str]:
+def get_host_addresses(use_ipv4: bool, use_ipv6: bool) -> list[str]:
     """
     Get local IP addresses.
     """
@@ -90,9 +92,48 @@ def get_host_addresses(use_ipv4: bool, use_ipv6: bool) -> List[str]:
     return addresses
 
 
+async def relayed_candidate(
+    component: int,
+    protocol_factory: Callable[[], "StunProtocol"],
+    turn_server: tuple[str, int],
+    turn_username: Optional[str],
+    turn_password: Optional[str],
+    turn_ssl: bool,
+    turn_transport: str,
+) -> tuple[Candidate, "StunProtocol"]:
+    """
+    Connect to a TURN server to obtain a relayed candidate.
+    """
+    # Connect to TURN server.
+    _, protocol = await turn.create_turn_endpoint(
+        protocol_factory,
+        server_addr=turn_server,
+        username=turn_username,
+        password=turn_password,
+        ssl=turn_ssl,
+        transport=turn_transport,
+    )
+
+    # Build relayed candidate.
+    candidate_address = protocol.transport.get_extra_info("sockname")
+    related_address = protocol.transport.get_extra_info("related_address")
+    protocol.local_candidate = Candidate(
+        foundation=candidate_foundation("relay", "udp", candidate_address[0]),
+        component=component,
+        transport="udp",
+        priority=candidate_priority(component, "relay"),
+        host=candidate_address[0],
+        port=candidate_address[1],
+        type="relay",
+        related_address=related_address[0],
+        related_port=related_address[1],
+    )
+    return protocol.local_candidate, protocol
+
+
 async def server_reflexive_candidate(
-    protocol, stun_server: Tuple[str, int]
-) -> Candidate:
+    protocol: "StunProtocol", stun_server: tuple[str, int]
+) -> tuple[Candidate, None]:
     """
     Query STUN server to obtain a server-reflexive candidate.
     """
@@ -120,10 +161,10 @@ async def server_reflexive_candidate(
         type="srflx",
         related_address=local_candidate.host,
         related_port=local_candidate.port,
-    )
+    ), None
 
 
-def sort_candidate_pairs(pairs, ice_controlling: bool) -> None:
+def sort_candidate_pairs(pairs: list["CandidatePair"], ice_controlling: bool) -> None:
     """
     Sort a list of candidate pairs.
     """
@@ -136,6 +177,16 @@ def sort_candidate_pairs(pairs, ice_controlling: bool) -> None:
     pairs.sort(key=pair_priority)
 
 
+def validate_password(value: str) -> None:
+    """
+    Check the password is well-formed.
+
+    See RFC 5245 - 15.4. "ice-ufrag" and "ice-pwd" Attributes
+    """
+    if not re.match("^[a-z0-9+/]{22,256}$", value):
+        raise ValueError("Password must satisfy 22*256ice-char")
+
+
 def validate_remote_candidate(candidate: Candidate) -> Candidate:
     """
     Check the remote candidate is supported.
@@ -146,8 +197,18 @@ def validate_remote_candidate(candidate: Candidate) -> Candidate:
     return candidate
 
 
+def validate_username(value: str) -> None:
+    """
+    Check the username is well-formed.
+
+    See RFC 5245 - 15.4. "ice-ufrag" and "ice-pwd" Attributes
+    """
+    if not re.match("^[a-z0-9+/]{4,256}$", value):
+        raise ValueError("Username must satisfy 4*256ice-char")
+
+
 class CandidatePair:
-    def __init__(self, protocol, remote_candidate: Candidate) -> None:
+    def __init__(self, protocol: "StunProtocol", remote_candidate: Candidate) -> None:
         self.task: Optional[asyncio.Task] = None
         self.nominated = False
         self.protocol = protocol
@@ -163,7 +224,7 @@ class CandidatePair:
         return self.local_candidate.component
 
     @property
-    def local_addr(self) -> Tuple[str, int]:
+    def local_addr(self) -> tuple[str, int]:
         return (self.local_candidate.host, self.local_candidate.port)
 
     @property
@@ -171,7 +232,7 @@ class CandidatePair:
         return self.protocol.local_candidate
 
     @property
-    def remote_addr(self) -> Tuple[str, int]:
+    def remote_addr(self) -> tuple[str, int]:
         return (self.remote_candidate.host, self.remote_candidate.port)
 
     class State(enum.Enum):
@@ -183,13 +244,13 @@ class CandidatePair:
 
 
 class StunProtocol(asyncio.DatagramProtocol):
-    def __init__(self, receiver) -> None:
+    def __init__(self, receiver: "Connection") -> None:
         self.__closed: asyncio.Future[bool] = asyncio.Future()
         self.id = next(protocol_id)
         self.local_candidate: Optional[Candidate] = None
         self.receiver = receiver
         self.transport: Optional[asyncio.DatagramTransport] = None
-        self.transactions: Dict[bytes, stun.Transaction] = {}
+        self.transactions: dict[bytes, stun.Transaction] = {}
 
     def connection_lost(self, exc: Exception) -> None:
         self.__log_debug("connection_lost(%s)", exc)
@@ -197,11 +258,11 @@ class StunProtocol(asyncio.DatagramProtocol):
             self.receiver.data_received(None, None)
             self.__closed.set_result(True)
 
-    def connection_made(self, transport) -> None:
+    def connection_made(self, transport: asyncio.BaseTransport) -> None:
         self.__log_debug("connection_made(%s)", transport)
-        self.transport = transport
+        self.transport = cast(asyncio.DatagramTransport, transport)
 
-    def datagram_received(self, data: Union[bytes, Text], addr: Tuple) -> None:
+    def datagram_received(self, data: Union[bytes, str], addr: tuple) -> None:
         # force IPv6 four-tuple to a two-tuple
         addr = (addr[0], addr[1])
         data = cast(bytes, data)
@@ -234,10 +295,10 @@ class StunProtocol(asyncio.DatagramProtocol):
     async def request(
         self,
         request: stun.Message,
-        addr: Tuple[str, int],
+        addr: tuple[str, int],
         integrity_key: Optional[bytes] = None,
-        retransmissions=None,
-    ) -> Tuple[stun.Message, Tuple[str, int]]:
+        retransmissions: Optional[int] = None,
+    ) -> tuple[stun.Message, tuple[str, int]]:
         """
         Execute a STUN transaction and return the response.
         """
@@ -255,17 +316,17 @@ class StunProtocol(asyncio.DatagramProtocol):
         finally:
             del self.transactions[request.transaction_id]
 
-    async def send_data(self, data: bytes, addr: Tuple[str, int]) -> None:
+    async def send_data(self, data: bytes, addr: tuple[str, int]) -> None:
         self.transport.sendto(data, addr)
 
-    def send_stun(self, message: stun.Message, addr: Tuple[str, int]) -> None:
+    def send_stun(self, message: stun.Message, addr: tuple[str, int]) -> None:
         """
         Send a STUN message.
         """
         self.__log_debug("> %s %s", addr, message)
         self.transport.sendto(bytes(message), addr)
 
-    def __log_debug(self, msg: str, *args) -> None:
+    def __log_debug(self, msg: str, *args: object) -> None:
         logger.debug("%s %s " + msg, self.receiver, self, *args)
 
     def __repr__(self) -> str:
@@ -297,6 +358,10 @@ class Connection:
     :param use_ipv4: Whether to use IPv4 candidates.
     :param use_ipv6: Whether to use IPv6 candidates.
     :param transport_policy: Transport policy.
+    :param local_username: An optional local username, otherwise a random one
+                           will be generated.
+    :param local_password: An optional local password, otherwise a random one
+                           will be generated.
     :param ephemeral_ports: Set of allowed ephemeral local ports to bind to.
     """
 
@@ -304,8 +369,8 @@ class Connection:
         self,
         ice_controlling: bool,
         components: int = 1,
-        stun_server: Optional[Tuple[str, int]] = None,
-        turn_server: Optional[Tuple[str, int]] = None,
+        stun_server: Optional[tuple[str, int]] = None,
+        turn_server: Optional[tuple[str, int]] = None,
         turn_username: Optional[str] = None,
         turn_password: Optional[str] = None,
         turn_ssl: bool = False,
@@ -313,13 +378,22 @@ class Connection:
         use_ipv4: bool = True,
         use_ipv6: bool = True,
         transport_policy: TransportPolicy = TransportPolicy.ALL,
+        local_username: Optional[str] = None,
+        local_password: Optional[str] = None,
         ephemeral_ports: Optional[Iterable[int]] = None,
     ) -> None:
         self.ice_controlling = ice_controlling
-        #: Local username, automatically set to a random value.
-        self.local_username = random_string(4)
-        #: Local password, automatically set to a random value.
-        self.local_password = random_string(22)
+
+        if local_username is None:
+            local_username = random_string(4)
+        else:
+            validate_username(local_username)
+
+        if local_password is None:
+            local_password = random_string(22)
+        else:
+            validate_password(local_password)
+
         #: Whether the remote party is an ICE Lite implementation.
         self.remote_is_lite = False
         #: Remote username, which you need to set.
@@ -337,25 +411,29 @@ class Connection:
         # private
         self._closed = False
         self._components = set(range(1, components + 1))
-        self._check_list: List[CandidatePair] = []
+        self._check_list: list[CandidatePair] = []
         self._check_list_done = False
         self._check_list_state: asyncio.Queue = asyncio.Queue()
-        self._early_checks: List[
-            Tuple[stun.Message, Tuple[str, int], StunProtocol]
+        self._early_checks: list[
+            tuple[stun.Message, tuple[str, int], StunProtocol]
         ] = []
         self._early_checks_done = False
         self._event_waiter: Optional[asyncio.Future[ConnectionEvent]] = None
         self._id = next(connection_id)
-        self._local_candidates: List[Candidate] = []
+        self._local_candidates: list[Candidate] = []
         self._local_candidates_end = False
         self._local_candidates_start = False
-        self._nominated: Dict[int, CandidatePair] = {}
-        self._nominating: Set[int] = set()
-        self._protocols: List[StunProtocol] = []
-        self._remote_candidates: List[Candidate] = []
+        self._local_password = local_password
+        self._local_username = local_username
+        self._nominated: dict[int, CandidatePair] = {}
+        self._nominating: set[int] = set()
+        self._protocols: list[StunProtocol] = []
+        self._remote_candidates: list[Candidate] = []
         self._remote_candidates_end = False
         self._query_consent_task: Optional[asyncio.Task] = None
-        self._queue: asyncio.Queue = asyncio.Queue()
+        self._queue: asyncio.Queue[tuple[Optional[bytes], Optional[int]]] = (
+            asyncio.Queue()
+        )
         self._tie_breaker = secrets.randbits(64)
         self._use_ipv4 = use_ipv4
         self._use_ipv6 = use_ipv6
@@ -373,21 +451,35 @@ class Connection:
         self._transport_policy = transport_policy
 
     @property
-    def local_candidates(self) -> List[Candidate]:
+    def local_candidates(self) -> list[Candidate]:
         """
         Local candidates, automatically set by :meth:`gather_candidates`.
         """
         return self._local_candidates[:]
 
     @property
-    def remote_candidates(self) -> List[Candidate]:
+    def local_password(self) -> str:
+        """
+        Local password, set at construction time.
+        """
+        return self._local_password
+
+    @property
+    def local_username(self) -> str:
+        """
+        Local username, set at construction time.
+        """
+        return self._local_username
+
+    @property
+    def remote_candidates(self) -> list[Candidate]:
         """
         Remote candidates, which you need to populate using
         :meth:`add_remote_candidate`.
         """
         return self._remote_candidates[:]
 
-    async def add_remote_candidate(self, remote_candidate: Candidate) -> None:
+    async def add_remote_candidate(self, remote_candidate: Optional[Candidate]) -> None:
         """
         Add a remote candidate or signal end-of-candidates.
 
@@ -580,7 +672,7 @@ class Connection:
         data, component = await self.recvfrom()
         return data
 
-    async def recvfrom(self) -> Tuple[bytes, int]:
+    async def recvfrom(self) -> tuple[bytes, int]:
         """
         Receive the next datagram.
 
@@ -723,7 +815,7 @@ class Connection:
             self._check_list_done = True
 
     def check_incoming(
-        self, message: stun.Message, addr: Tuple[str, int], protocol: StunProtocol
+        self, message: stun.Message, addr: tuple[str, int], protocol: StunProtocol
     ) -> None:
         """
         Handle a succesful incoming check.
@@ -883,8 +975,8 @@ class Connection:
         return None
 
     async def get_component_candidates(
-        self, component: int, addresses: List[str], timeout: int = 5
-    ) -> List[Candidate]:
+        self, component: int, addresses: list[str], timeout: int = 5
+    ) -> list[Candidate]:
         candidates = []
         #loop = asyncio.get_event_loop()
 
@@ -923,9 +1015,10 @@ class Connection:
                 candidates.append(protocol.local_candidate)
         self._protocols += host_protocols
 
-        # query STUN server for server-reflexive candidates (IPv4 only)
+        tasks: list[asyncio.Task[tuple[Candidate, Optional[StunProtocol]]]] = []
+
+        # Query STUN server for server-reflexive candidates (IPv4 only).
         if self.stun_server:
-            tasks = []
             for protocol in host_protocols:
                 if ipaddress.ip_address(protocol.local_candidate.host).version == 4:
                     tasks.append(
@@ -933,42 +1026,34 @@ class Connection:
                             server_reflexive_candidate(protocol, self.stun_server)
                         )
                     )
-            if len(tasks):
-                done, pending = await asyncio.wait(tasks, timeout=timeout)
-                candidates += [
-                    task.result() for task in done if task.exception() is None
-                ]
-                for task in pending:
-                    task.cancel()
 
-        # connect to TURN server
+        # Connect to TURN server.
         if self.turn_server:
-            # create transport
-            _, protocol = await turn.create_turn_endpoint(
-                lambda: StunProtocol(self),
-                server_addr=self.turn_server,
-                username=self.turn_username,
-                password=self.turn_password,
-                ssl=self.turn_ssl,
-                transport=self.turn_transport,
+            tasks.append(
+                asyncio.create_task(
+                    relayed_candidate(
+                        component=component,
+                        protocol_factory=lambda: StunProtocol(self),
+                        turn_server=self.turn_server,
+                        turn_username=self.turn_username,
+                        turn_password=self.turn_password,
+                        turn_ssl=self.turn_ssl,
+                        turn_transport=self.turn_transport,
+                    )
+                )
             )
-            self._protocols.append(protocol)
 
-            # add relayed candidate
-            candidate_address = protocol.transport.get_extra_info("sockname")
-            related_address = protocol.transport.get_extra_info("related_address")
-            protocol.local_candidate = Candidate(
-                foundation=candidate_foundation("relay", "udp", candidate_address[0]),
-                component=component,
-                transport="udp",
-                priority=candidate_priority(component, "relay"),
-                host=candidate_address[0],
-                port=candidate_address[1],
-                type="relay",
-                related_address=related_address[0],
-                related_port=related_address[1],
-            )
-            candidates.append(protocol.local_candidate)
+        # Run tasks in parallel and handle exceptions.
+        if len(tasks):
+            done, pending = await asyncio.wait(tasks, timeout=timeout)
+            for task in done:
+                if task.exception() is None:
+                    candidate, protocol = task.result()
+                    candidates.append(candidate)
+                    if protocol is not None:
+                        self._protocols.append(protocol)
+            for task in pending:
+                task.cancel()
 
         return candidates
 
@@ -1012,13 +1097,13 @@ class Connection:
                     self._query_consent_task = None
                     return await self.close()
 
-    def data_received(self, data: bytes, component: int) -> None:
+    def data_received(self, data: Optional[bytes], component: Optional[int]) -> None:
         self._queue.put_nowait((data, component))
 
     def request_received(
         self,
         message: stun.Message,
-        addr: Tuple[str, int],
+        addr: tuple[str, int],
         protocol: StunProtocol,
         raw_data: bytes,
     ) -> None:
@@ -1071,9 +1156,9 @@ class Connection:
     def respond_error(
         self,
         request: stun.Message,
-        addr: Tuple[str, int],
+        addr: tuple[str, int],
         protocol: StunProtocol,
-        error_code: Tuple[int, str],
+        error_code: tuple[int, str],
     ) -> None:
         response = stun.Message(
             message_method=request.message_method,
@@ -1117,7 +1202,7 @@ class Connection:
                 self.check_state(pair, CandidatePair.State.WAITING)
                 seen_foundations.add(pair.local_candidate.foundation)
 
-    def __log_info(self, msg: str, *args) -> None:
+    def __log_info(self, msg: str, *args: object) -> None:
         logger.info("%s " + msg, self, *args)
 
     def __repr__(self) -> str:
